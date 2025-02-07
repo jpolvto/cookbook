@@ -1,6 +1,5 @@
 import os
 import plotly
-from io import BytesIO
 from pathlib import Path
 from typing import List
 
@@ -11,6 +10,7 @@ from literalai.helper import utc_now
 import chainlit as cl
 from chainlit.config import config
 from chainlit.element import Element
+from chainlit.context import local_steps
 from openai.types.beta.threads.runs import RunStep
 
 
@@ -23,6 +23,7 @@ assistant = sync_openai_client.beta.assistants.retrieve(
 
 config.ui.name = assistant.name
 
+
 class EventHandler(AsyncAssistantEventHandler):
 
     def __init__(self, assistant_name: str) -> None:
@@ -31,6 +32,10 @@ class EventHandler(AsyncAssistantEventHandler):
         self.current_step: cl.Step = None
         self.current_tool_call = None
         self.assistant_name = assistant_name
+        previous_steps = local_steps.get() or []
+        parent_step = previous_steps[-1] if previous_steps else None
+        if parent_step:
+            self.parent_id = parent_step.id
 
     async def on_run_step_created(self, run_step: RunStep) -> None:
         cl.user_session.set("run_step", run_step)
@@ -45,7 +50,6 @@ class EventHandler(AsyncAssistantEventHandler):
     async def on_text_done(self, text):
         await self.current_message.update()
         if text.annotations:
-            print(text.annotations)
             for annotation in text.annotations:
                 if annotation.type == "file_path":
                     response = await async_openai_client.files.with_raw_response.content(annotation.file_path.file_id)
@@ -68,7 +72,7 @@ class EventHandler(AsyncAssistantEventHandler):
 
     async def on_tool_call_created(self, tool_call):
         self.current_tool_call = tool_call.id
-        self.current_step = cl.Step(name=tool_call.type, type="tool", parent_id=cl.context.current_run.id)
+        self.current_step = cl.Step(name=tool_call.type, type="tool", parent_id=self.parent_id)
         self.current_step.show_input = "python"
         self.current_step.start = utc_now()
         await self.current_step.send()
@@ -76,7 +80,7 @@ class EventHandler(AsyncAssistantEventHandler):
     async def on_tool_call_delta(self, delta, snapshot): 
         if snapshot.id != self.current_tool_call:
             self.current_tool_call = snapshot.id
-            self.current_step = cl.Step(name=delta.type, type="tool",  parent_id=cl.context.current_run.id)
+            self.current_step = cl.Step(name=delta.type, type="tool", parent_id=self.parent_id)
             self.current_step.start = utc_now()
             if snapshot.type == "code_interpreter":
                  self.current_step.show_input = "python"
@@ -129,15 +133,6 @@ class EventHandler(AsyncAssistantEventHandler):
         await self.current_message.update()
 
 
-@cl.step(type="tool")
-async def speech_to_text(audio_file):
-    response = await async_openai_client.audio.transcriptions.create(
-        model="whisper-1", file=audio_file
-    )
-
-    return response.text
-
-
 async def upload_files(files: List[Element]):
     file_ids = []
     for file in files:
@@ -177,6 +172,7 @@ async def set_starters():
             icon="/public/write.svg",
             )
         ]
+    
 
 @cl.on_chat_start
 async def start_chat():
@@ -184,8 +180,8 @@ async def start_chat():
     thread = await async_openai_client.beta.threads.create()
     # Store thread ID in user session for later use
     cl.user_session.set("thread_id", thread.id)
-    
-    
+
+
 @cl.on_stop
 async def stop_chat():
     current_run_step: RunStep = cl.user_session.get("run_step")
@@ -197,7 +193,7 @@ async def stop_chat():
 async def main(message: cl.Message):
     thread_id = cl.user_session.get("thread_id")
 
-    attachments = await process_files(message.elements)
+    attachments = await process_files([el for el in message.elements if el.path])
 
     # Add a Message to the Thread
     oai_message = await async_openai_client.beta.threads.messages.create(
